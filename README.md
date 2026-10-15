@@ -27,10 +27,11 @@ The KB path defaults to `./kb.json`. Any file with the same schema (a list of `{
 
 ```bash
 python validate.py        # runs the real CLI in a fresh process: 8 checks
-python -m unittest -v     # 13 tests: ask() end to end + intent classification
+python -m unittest -v     # 15 tests: ask() end to end + intent classification
+python eval.py            # 8 labelled questions: accuracy + citation presence rate
 ```
 
-Both need no API key or network. `validate.py` checks that the KB loads, answerable questions return grounded citations, the brief's three unsupported questions abstain, and the output JSON has the required keys. The unit tests also prove a **replacement `kb.json`** is read from disk and used.
+All three need no API key or network (`python eval.py --llm` uses Gemini if a key is set). `validate.py` checks that the KB loads, answerable questions return grounded citations, the brief's three unsupported questions abstain, and the output JSON has the required keys. The unit tests also prove a **replacement `kb.json`** is read from disk and used.
 
 ## Example output
 
@@ -54,7 +55,7 @@ Both need no API key or network. `validate.py` checks that the KB loads, answera
 ## How it works
 
 ```
-LOAD_KB -> RETRIEVE -> CLASSIFY_INTENT -> CHECK_SUPPORT -> ANSWER_OR_ABSTAIN
+LOAD_KB -> NORMALIZE -> RETRIEVE -> CLASSIFY_INTENT -> CHECK_SUPPORT -> ANSWER_OR_ABSTAIN
 ```
 
 Each stage declares what it reads and writes. The runner (`run_pipeline` in `app.py`) rejects a stage that reads a missing key or writes an undeclared one, and records every stage in `debug.trace`. No answer text is produced before RETRIEVE and CHECK_SUPPORT have run.
@@ -62,15 +63,18 @@ Each stage declares what it reads and writes. The runner (`run_pipeline` in `app
 | Stage | Reads | Writes | File |
 |---|---|---|---|
 | LOAD_KB | `kb_path` | `kb`, `index` | `kb.py`, `retrieval.py` |
-| RETRIEVE | `question`, `index` | `retrieved` (top 3 + BM25) | `retrieval.py` |
+| NORMALIZE | `question`, `kb` | `normalized`, `corrections` | `normalize.py` |
+| RETRIEVE | `normalized`, `index` | `retrieved` (top 3 + BM25) | `retrieval.py` |
 | CLASSIFY_INTENT | `question`, `kb`, `llm` | `intent` | `intent.py` |
-| CHECK_SUPPORT | `question`, `kb`, `retrieved`, `intent` | `support` | `app.py` |
-| ANSWER_OR_ABSTAIN | `question`, `kb`, `intent`, `support` | `decision`, `answer`, `citations` | `app.py`, `templates.py` |
+| CHECK_SUPPORT | `normalized`, `corrections`, `kb`, `retrieved`, `intent` | `support` | `app.py` |
+| ANSWER_OR_ABSTAIN | `normalized`, `kb`, `intent`, `support` | `decision`, `answer`, `citations` | `app.py`, `templates.py` |
+
+**Typos and shorthand (NORMALIZE):** chat shorthand is expanded (`pls`, `u`, `hrs`). A word of 4+ letters that is not known is replaced by its closest known word (`difflib`, similarity >= 0.8). Known words are everything in `kb.json` plus the policy keywords and stopwords, so corrections can only point at words the system already knows and follow a replacement KB. A word whose stem is already known (`long` when `longer` is in the KB) is left alone. The output keeps the original `question`; `debug.normalized` and `debug.corrections` show what changed.
 
 **Retrieval:** BM25 over each article's title and text, with stopword removal and light suffix stemming (`closing`, `closure` and `closed` all match).
 
 **Intent classification:** labels are one per KB doc id (built from `kb.json`), plus `legal_advice`, `tax_advice`, `trading_advice`, `processing_guarantee` and `other`.
-1. **Restricted keyword rules run first and always win.** These questions get a fixed refusal and are never sent to Gemini.
+1. **Restricted keyword rules run first and always win.** They match raw words or stems on both the raw and the corrected question, so "taxs", "suee" and "guarentee" are still caught. These questions get a fixed refusal and are never sent to Gemini.
 2. A keyword-overlap rule picks the doc with the most matching question words.
 3. **Gemini is called only when no doc matches or the top docs tie.** Its output is forced to the allowed labels (enum response schema).
 4. Without Gemini, or on an error or an invalid label: no match gives `other`, a tie gives `ambiguous`. Both abstain.
@@ -89,7 +93,10 @@ support_score = 0.95 * (0.7 * coverage + 0.3 * margin) * strength
   coverage = share of the question's content words found in the evidence doc
   margin   = (best BM25 - second BM25) / best BM25   (1.0 if only one doc matched)
   strength = b / (b + 1), b = the evidence doc's BM25
+  typo_factor = 1 - 0.1 * (corrected words / question content words)
 ```
+
+(`support_score` is multiplied by `typo_factor`, so a guessed spelling lowers confidence: "How do I rest my pasword?" scores 0.717 against 0.797 for the correctly spelled question.)
 
 `strength` is always below 1, so the score always stays below 0.95, and it differs by question (0.649 to 0.85 on the sample answerable questions). Coverage is measured against **one** document, so an answer can never be stitched together from two unrelated articles.
 
@@ -104,7 +111,8 @@ No chunking. Each sample article is 3 to 4 sentences, and splitting would separa
 ## Trade-offs and limitations
 
 - **False refusals over false answers.** Keyword coverage can refuse a paraphrase that uses words not in the KB (for example "valid" vs "expires"). For a support bot that is the safer failure.
-- **Typos.** Misspelled questions currently abstain, which is safe but unhelpful, and a misspelled policy word ("suee", "guarentee") can skip the restricted rules and reach Gemini. `SPEC.md` describes the planned fix: a NORMALIZE stage with fuzzy correction against the KB vocabulary, with restricted rules checking both the raw and corrected text.
+- **Typos.** Words under 4 letters are not corrected ("shoud i by bitcoin" falls to `other`, which still abstains). A correct word missing from the KB could be "corrected" into a KB word; the support check still has to pass, so this can cause a refusal but not an ungrounded answer.
+- **Eval is in-sample.** `eval.py` scores 8/8 in both modes, but these questions were seen during development, so it shows the rules behave as designed rather than proving they generalize.
 - **Restricted keyword lists** are hand-written policy, not learned. They are deliberately broad, since a wrong refusal is cheap.
 - **Gemini is used only for intent.** It never writes answer text and never makes the final answer/abstain decision.
 
@@ -116,8 +124,10 @@ No chunking. Each sample article is 3 to 4 sentences, and splitting would separa
 | `app.py` | Pipeline runner, stages, support check, CLI |
 | `kb.py` | Loads and validates `kb.json` |
 | `retrieval.py` | BM25 index |
+| `normalize.py` | Typo and shorthand correction |
 | `intent.py` | Intent rules and the optional Gemini classifier |
 | `templates.py` | Fixed refusal and abstain messages |
 | `textproc.py` | Tokenising, stemming, sentence splitting |
 | `validate.py` | Validation script (CLI, fresh process) |
 | `test_app.py` | Unit tests |
+| `eval.py` | Evaluation script (accuracy, citation presence rate) |
