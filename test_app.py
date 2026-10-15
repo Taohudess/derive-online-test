@@ -62,6 +62,18 @@ class AskAnswers(unittest.TestCase):
         self.assertEqual(len(set(scores)), len(scores), scores)
 
 
+class AskTypos(unittest.TestCase):
+    def test_misspelled_question_is_answered_with_lower_confidence(self):
+        clean = ask_rules("How do I reset my password?")
+        r = ask_rules("How do I rest my pasword?")
+        self.assertEqual(r["question"], "How do I rest my pasword?")
+        self.assertEqual(r["decision"], "answer")
+        self.assertEqual(r["citations"][0]["id"], "doc_1")
+        self.assertEqual(r["debug"]["corrections"],
+                         {"rest": "reset", "pasword": "password"})
+        self.assertLess(r["debug"]["support_score"], clean["debug"]["support_score"])
+
+
 class AskAbstains(unittest.TestCase):
     def test_brief_examples_abstain_without_citations(self):
         for q in ["Can you guarantee my withdrawal will finish in 2 hours?",
@@ -133,6 +145,16 @@ class ClassifyIntent(unittest.TestCase):
                 g = FakeGemini(reply="a")
                 r = classify(q, KB, llm=g)
                 self.assertEqual((r.label, r.source, r.restricted), (label, "rule", True))
+                self.assertEqual(g.calls, [])
+
+    def test_misspelled_restricted_questions_still_hit_the_rule(self):
+        for q, label in [("can i suee you", "legal_advice"),
+                         ("do i pay taxs on this", "tax_advice"),
+                         ("can u guarentee my withdrawl in 2 hrs", "processing_guarantee")]:
+            with self.subTest(q=q):
+                g = FakeGemini(reply="other")
+                r = classify(q, KB, llm=g)
+                self.assertEqual((r.label, r.source), (label, "rule"))
                 self.assertEqual(g.calls, [])
 
     def test_clear_keyword_match_skips_gemini(self):
